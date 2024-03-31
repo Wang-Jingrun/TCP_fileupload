@@ -4,7 +4,7 @@
 
 ## 文件传输数据格式
 
-![image-20240330163500437](imgs/image-20240330163500437.png)
+![数据头](imgs/数据头.png)
 
 - `head`：数据头
   - `head size`：`size_t`，数据头的大小，防止与文件内容发生粘包
@@ -19,7 +19,7 @@
 
 采用了线程池、非阻塞 socket、IO 多路复用 epoll 以及 reactor 事件处理模型
 
-![image-20240302111001698](imgs/image-20240302111001698.png)
+![服务端框架](imgs/服务端框架.png)
 
 ### 代码结构
 
@@ -39,7 +39,7 @@ fileupload_server
 - 当有连接请求时，将连接套接字加入监听队列。
 - 当有套接字可读时，在 `TaskFactory` 类中维护的 `map` 中寻找是否有该套接字对应的任务，如果没有则为其创建一个 `FileuploadTask`，同时将该任务交给 `TaskDispatcher` 线程。
   -  `TaskDispatcher` 线程负责进行任务的分发。当有新的任务到达时，它会先检查线程池中是否有空闲的工作线程。如果有空闲线程，则将任务指派给其中一个空闲线程进行处理。如果线程池中没有空闲线程，那么任务将被放入任务队列中，等待有空闲线程时再进行处理。如果任务队列为空，就等待条件变量的触发。
-  -  `FileuploadTask` 负责处理文件接收。当成员变量 `m_head_len == 0`，表明是第一次处理该连接套接字的请求，需要进行数据头解析，获取文件名和文件大小，同时创建文件并将文件内容保存。如果是接受大文件，那么对 `FileuploadTask` 的一次处理可能无法接收完成，之后由于成员变量 `m_head_len > 0`，直击将接收到的文件内容继续保存即可。
+  -  `FileuploadTask` 负责处理文件接收。当成员变量 `m_head_len == 0`，表明是第一次处理该连接套接字的请求，需要进行数据头解析，获取文件名和文件大小，同时创建文件并将文件内容保存。如果是接收大文件，那么对 `FileuploadTask` 的一次处理可能无法接收完成，不过之后由于成员变量 `m_head_len > 0`，直接将接收到的文件内容继续保存即可。
 
 ### 接收文件核心逻辑
 
@@ -228,9 +228,156 @@ bool ClientSocket::send_file(const string& filename)
 }
 ```
 
+## 生产者消费者模型
+
+服务端的 `TaskDispatcher` 和 `ThreadPool` 就是典型的生产者消费者模型：`TaskDispatcher` 即为生产者，负责接收新的任务并将其放入任务队列中。而`ThreadPool` 则是消费者，负责从任务队列中取出任务并进行处理。
+
+![生产者消费者模型](imgs/生产者消费者模型.png)
+
+###  `TaskDispatcher`
+
+```cpp
+/*
+protected:
+	std::list<Task *>   m_queue;
+	Mutex               m_mutex;
+	Condition           m_cond;
+*/
+
+#include <thread/task_dispatcher.h>
+using namespace yazi::thread;
+
+// 初始化
+void TaskDispatcher::init(int threads)
+{
+    Singleton<ThreadPool>::instance()->create(threads);
+    start();
+}
+
+// 主线程指派任务
+void TaskDispatcher::assign(Task * task)
+{
+    log_debug("task dispatcher assign task: %x", task);
+    AutoLock lock(&m_mutex);
+    m_queue.push_back(task);
+    m_cond.signal();
+}
+
+// 任务分发处理逻辑
+void TaskDispatcher::handle(Task * task)
+{
+    ThreadPool * pool = Singleton<ThreadPool>::instance();
+    if (!pool->empty())
+    {
+        // 将任务交由线程池中的空闲线程进行处理
+        pool->assign(task);
+    }
+    else
+    {
+        // 当线程池没有空闲线程时，将任务加入任务队列中
+        AutoLock lock(&m_mutex);
+        m_queue.push_front(task);
+        log_warn("all threads are busy!");
+    }
+}
+
+bool TaskDispatcher::empty()
+{
+    AutoLock lock(&m_mutex);
+    return m_queue.empty();
+}
+
+// 任务分发线程主函数
+void TaskDispatcher::run()
+{
+    sigset_t mask;
+    if (0 != sigfillset(&mask))
+    {
+        log_error("task dispatcher sigfillset error!");
+        return;
+    }
+    if (0 != pthread_sigmask(SIG_SETMASK, &mask, nullptr))
+    {
+        log_error("task dispatcher pthread_sigmask error!");
+        return;
+    }
+    while (true)
+    {
+        m_mutex.lock();
+        while (m_queue.empty()) // 任务队列为空，等待条件变量触发
+            m_cond.wait(&m_mutex);
+        Task * task = m_queue.front();
+        m_queue.pop_front();
+        m_mutex.unlock();
+        handle(task);
+    }
+}
+```
+
+### `ThreadPool`
+
+```cpp
+/*
+private:
+	int m_threads = 0;
+	std::list<WorkerThread *> m_pool;
+	Mutex m_mutex;
+	Condition m_cond;
+*/
+
+#include <thread/thread_pool.h>
+using namespace yazi::thread;
+
+// 初始化
+void ThreadPool::create(int threads)
+{
+    AutoLock lock(&m_mutex);
+    m_threads = threads;
+    for (int i = 0; i < threads; i++)
+    {
+        auto thread = new WorkerThread();
+        m_pool.push_back(thread);
+        thread->start();
+    }
+    log_debug("thread pool create worker threads: %d", threads);
+}
+
+// 获取一个空闲的工作线程，如果没有则等待条件变量
+WorkerThread * ThreadPool::get()
+{
+    AutoLock lock(&m_mutex);
+    while (m_pool.empty())
+        m_cond.wait(&m_mutex);
+    auto thread = m_pool.front();
+    m_pool.pop_front();
+    return thread;
+}
+
+// 工作线程执行完成任务后，将自己放入空闲队列
+void ThreadPool::put(WorkerThread * thread)
+{
+    AutoLock lock(&m_mutex);
+    m_pool.push_back(thread);
+    m_cond.signal();
+}
+
+bool ThreadPool::empty()
+{
+    AutoLock lock(&m_mutex);
+    return m_pool.empty();
+}
+
+// 将任务交由线程池中的空闲线程进行处理
+void ThreadPool::assign(Task * task)
+{
+    auto thread = get();
+    thread->assign(task);
+}
+```
+
 ## Todo
 
-- [ ] 支持带路径的文件
+- [ ] 支持带路径的文件，支持上传整个文件夹
 
 - [ ] 使用 QT 给客户端增加 UI，效果大致如下：
 
