@@ -23,7 +23,23 @@
 
 ### 代码结构
 
+```sh
+fileupload_server
+  ├─config		# 配置文件
+  ├─frame		# 服务器启动流程
+  ├─socket		# 网络模块：IO 多路复用 epoll 实现
+  ├─task		# 接收文件执行逻辑
+  ├─thread		# 线程池和任务队列
+  └─utility		# 工具类
+```
+
 ### 执行流程
+
+- 初始化：读取配置文件、配置日志系统、创建线程池和任务队列、绑定 IP 和端口开启监听模式。
+- 当有连接请求时，将连接套接字加入监听队列。
+- 当有套接字可读时，在 `TaskFactory` 类中维护的 `map` 中寻找是否有该套接字对应的任务，如果没有则为其创建一个 `FileuploadTask`，同时将该任务交给 `TaskDispatcher` 线程。
+  -  `TaskDispatcher` 线程负责进行任务的分发。当有新的任务到达时，它会先检查线程池中是否有空闲的工作线程。如果有空闲线程，则将任务指派给其中一个空闲线程进行处理。如果线程池中没有空闲线程，那么任务将被放入任务队列中，等待有空闲线程时再进行处理。如果任务队列为空，就等待条件变量的触发。
+  -  `FileuploadTask` 负责处理文件接收。当成员变量 `m_head_len == 0`，表明是第一次处理该连接套接字的请求，需要进行数据头解析，获取文件名和文件大小，同时创建文件并将文件内容保存。如果是接受大文件，那么对 `FileuploadTask` 的一次处理可能无法接收完成，之后由于成员变量 `m_head_len > 0`，直击将接收到的文件内容继续保存即可。
 
 ### 接收文件核心逻辑
 
@@ -95,7 +111,7 @@ void FileuploadTask::run()
           m_filename = file_info.substr(0, point_pos) + '-' + generateRandomString(8)
              + file_info.substr(point_pos, sep_pos - point_pos);
 
-          std::string file_size_str = file_info.substr(sep_pos + 1);
+          string file_size_str = file_info.substr(sep_pos + 1);
           memcpy(&m_file_len, file_size_str.c_str(), sizeof(uint64_t));
        }
        else
@@ -132,6 +148,12 @@ void FileuploadTask::run()
 ## 客户端
 
 ### 代码结构
+
+```sh
+fileupload_client
+  ├─socket		# 网络模块
+  └─utility		# 工具类
+```
 
 ### 发送文件核心逻辑
 
